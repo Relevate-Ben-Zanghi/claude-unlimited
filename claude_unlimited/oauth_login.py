@@ -7,36 +7,44 @@ what happens afterwards: refresh_access_token() exchanges a stored
 refresh_token for a new access token, so a Profile never needs manual
 re-authentication merely because its token expired.
 
-CLIENT_ID is Claude Code's own public OAuth client id; PKCE public clients
-don't use a client secret, so this is not a leaked credential, it's how
-the protocol is designed to work for a locally-run CLI.
+CLIENT_ID is the public OAuth client id the grant was issued to. PKCE public
+clients don't use a client secret, so this is not a leaked credential; a
+refresh_token can only be redeemed against the client it was issued for.
+
+This module identifies itself honestly. The refresh request carries a
+`claude-unlimited/<version>` User-Agent and is sent with the standard
+library's HTTP client. It does not imitate another client's headers or TLS
+fingerprint to get past the endpoint's bot management. If the endpoint
+rejects the request on that basis, the honest outcome is a clear error
+telling the user the account needs a re-login through Claude Code itself,
+not a disguised retry.
 """
 
 from __future__ import annotations
 
 import json
-import shutil
-import subprocess
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Optional
 
+from . import __version__
+
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 TOKEN_ENDPOINT = "https://platform.claude.com/v1/oauth/token"
 
-# Make our refresh request look like Claude Code's, which refreshes the same
-# grants for weeks without being rate limited from the same machine/IP. Anthropic's
-# token endpoint appears to bucket refreshes by client shape: a call that omits the
-# scope field and doesn't carry Claude Code's axios User-Agent lands in a throttled
-# bucket and gets a persistent 429 (rate_limit_error), even on a brand-new grant.
-# These two values (extracted from the Claude Code 2.1.252 bundle) close the visible
-# gap. The one thing we still can't match from Python/curl is the TLS/JA3
-# fingerprint (curl vs node); if that turns out to be what's classified, the
-# fallback is to delegate the refresh to the real `claude` CLI per account.
+# RFC 6749 §6 lets a refresh request restate the scopes of the original
+# grant. These are the scopes a Claude Code login is issued with, and the
+# refreshed token needs the same ones to be usable for inference.
 REFRESH_SCOPE = "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
-REFRESH_USER_AGENT = "axios/1.9.0"
+
+USER_AGENT = f"claude-unlimited/{__version__}"
+
+# Cloudflare's bot-management challenge in front of the token endpoint
+# answers with this status and body when it declines a client. Surfaced as
+# a readable message rather than circumvented.
+_CLOUDFLARE_BLOCK_STATUS = 403
 
 
 class OAuthLoginError(RuntimeError):
@@ -56,69 +64,19 @@ class LoginTokens:
     expires_at: Optional[int]
 
 
-def _parse_curl_header_dump(raw: bytes) -> dict:
-    """Parses curl's `-D` header-block output (one status line, then
-    `Name: value` lines, ending at the blank line before the body) into a
-    lowercased-key dict. No `-L` is passed to curl, so there is never more
-    than one status line or header block."""
-    headers = {}
-    for line in raw.decode("utf-8", errors="replace").splitlines():
-        if not line or line.startswith("HTTP/"):
-            continue
-        name, sep, value = line.partition(":")
-        if sep:
-            headers[name.strip().lower()] = value.strip()
-    return headers
+def _post_json(url: str, payload: bytes, timeout: float,
+               extra_headers: Optional[dict] = None) -> tuple[int, dict, bytes]:
+    """POST JSON with the standard library and return (status_code, headers, body).
 
-
-def _post_json_via_curl(url: str, payload: bytes, timeout: float,
-                         extra_headers: Optional[dict] = None) -> tuple[int, dict, bytes]:
-    """Caller must already know curl is on PATH. Raises OAuthLoginError on
-    any curl-level failure (network error, timeout) rather than falling back
-    to urllib: if curl couldn't reach the host, urllib won't either, and the
-    fallback would only obscure the error."""
-    import tempfile
-    from pathlib import Path
-
-    header_file = tempfile.NamedTemporaryFile(prefix="claude-unlimited-oauth-headers-", delete=False)
-    header_path = header_file.name
-    header_file.close()
-    header_args = []
-    for name, value in {"Content-Type": "application/json", **(extra_headers or {})}.items():
-        header_args += ["-H", f"{name}: {value}"]
-    try:
-        try:
-            proc = subprocess.run(
-                ["curl", "-sS", "--compressed", "-X", "POST", url,  # --compressed: Accept-Encoding like axios, curl decodes the body
-                 *header_args,
-                 "--data-binary", "@-",
-                 "-D", header_path,  # separate file, so stdout stays body-only (see -w below)
-                 "-w", "\n%{http_code}",
-                 "--max-time", str(max(1, int(timeout)))],
-                input=payload, capture_output=True, timeout=timeout + 5,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise OAuthLoginError(f"Timed out reaching the token endpoint: {exc}") from exc
-
-        if proc.returncode != 0:
-            raise OAuthLoginError(
-                f"Could not reach the token endpoint (curl exit {proc.returncode}): "
-                f"{proc.stderr.decode('utf-8', errors='replace')[:300]}"
-            )
-
-        body, _, status_str = proc.stdout.rpartition(b"\n")
-        if not status_str.isdigit():
-            raise OAuthLoginError("Could not parse curl's response to the token endpoint.")
-
-        headers = _parse_curl_header_dump(Path(header_path).read_bytes())
-        return int(status_str), headers, body
-    finally:
-        Path(header_path).unlink(missing_ok=True)
-
-
-def _post_json_via_urllib(url: str, payload: bytes, timeout: float,
-                           extra_headers: Optional[dict] = None) -> tuple[int, dict, bytes]:
-    headers = {"Content-Type": "application/json", **(extra_headers or {})}
+    An HTTP error status is returned, not raised, so the caller can decide
+    what is retryable. Only a network-level failure (DNS, connection,
+    timeout) raises OAuthLoginError."""
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": USER_AGENT,
+        **(extra_headers or {}),
+    }
     req = urllib.request.Request(url, data=payload, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -126,22 +84,9 @@ def _post_json_via_urllib(url: str, payload: bytes, timeout: float,
     except urllib.error.HTTPError as exc:
         return exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read()
     except urllib.error.URLError as exc:
-        raise OAuthLoginError(f"Could not reach the token endpoint: {exc}") from exc
-
-
-def _post_json(url: str, payload: bytes, timeout: float,
-                extra_headers: Optional[dict] = None) -> tuple[int, dict, bytes]:
-    """POST JSON and return (status_code, headers, body).
-
-    Prefers curl over urllib.request: Cloudflare bot management in front of
-    platform.claude.com rejects Python's bare urllib.request with a 403
-    ("error code: 1010") before the request reaches Anthropic, while curl's
-    TLS fingerprint is not flagged the same way. Falls back to urllib only
-    when curl isn't on PATH, which is degraded (the call may be blocked)
-    rather than broken."""
-    if shutil.which("curl"):
-        return _post_json_via_curl(url, payload, timeout, extra_headers)
-    return _post_json_via_urllib(url, payload, timeout, extra_headers)
+        raise OAuthLoginError(f"Could not reach the token endpoint: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise OAuthLoginError(f"Timed out reaching the token endpoint after {timeout:g}s") from exc
 
 
 def _normalize_expires_at(data: dict) -> Optional[int]:
@@ -170,6 +115,18 @@ def _normalize_expires_at(data: dict) -> Optional[int]:
     return None
 
 
+def _describe_failure(status: int, body: bytes) -> str:
+    detail = body.decode("utf-8", errors="replace")[:300]
+    if status == _CLOUDFLARE_BLOCK_STATUS and "error code: 1010" in detail:
+        return (
+            f"Token refresh failed (HTTP {status}): the token endpoint's bot protection "
+            "declined this client. Claude Unlimited does not disguise itself to get past "
+            "that check. Re-add the account with `claude-unlimited add-account` so Claude "
+            "Code performs the login itself."
+        )
+    return f"Token refresh failed (HTTP {status}): {detail}"
+
+
 def refresh_access_token(refresh_token: str, timeout: float = 30.0) -> LoginTokens:
     """Exchanges a stored refresh_token for a new access token, so an OAuth
     Profile keeps working past its original token's expiry without a manual
@@ -182,7 +139,7 @@ def refresh_access_token(refresh_token: str, timeout: float = 30.0) -> LoginToke
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
         "client_id": CLIENT_ID,
-        "scope": REFRESH_SCOPE,  # Claude Code sends this; omitting it is bucketed/throttled
+        "scope": REFRESH_SCOPE,
     }).encode("utf-8")
 
     max_retries = 2
@@ -193,13 +150,7 @@ def refresh_access_token(refresh_token: str, timeout: float = 30.0) -> LoginToke
         if attempt > 0:
             time.sleep(base_delay * (2 ** (attempt - 1)))
         try:
-            status, _headers, body = _post_json(
-                TOKEN_ENDPOINT, payload, timeout,
-                extra_headers={
-                    "Accept": "application/json, text/plain, */*",
-                    "User-Agent": REFRESH_USER_AGENT,  # match Claude Code's axios client
-                },
-            )
+            status, _headers, body = _post_json(TOKEN_ENDPOINT, payload, timeout)
         except OAuthLoginError as exc:
             last_exc = exc
             continue  # network-level failure: retry
@@ -207,8 +158,7 @@ def refresh_access_token(refresh_token: str, timeout: float = 30.0) -> LoginToke
         if status >= 500 and attempt < max_retries:
             continue  # transient server error: retry
         if status >= 400:
-            detail = body.decode("utf-8", errors="replace")[:300]
-            raise OAuthLoginError(f"Token refresh failed (HTTP {status}): {detail}", status_code=status)
+            raise OAuthLoginError(_describe_failure(status, body), status_code=status)
 
         try:
             data = json.loads(body)
